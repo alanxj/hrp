@@ -16,8 +16,14 @@
 
 __debug_bin
 .vscode/
+.idea/
 __pycache__
 .DS_Store
+*.bak
 
 site/
 output/
+
+# built plugins
+debugtalk.bin
+debugtalk.so

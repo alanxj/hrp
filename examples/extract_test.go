@@ -9,13 +9,11 @@ import (
 // reference extracted variables for validation in the same step
 func TestCaseExtractStepSingle(t *testing.T) {
 	testcase := &hrp.TestCase{
-		Config: hrp.TConfig{
-			Name:    "run request with variables",
-			BaseURL: "https://postman-echo.com",
-			Verify:  false,
-		},
+		Config: hrp.NewConfig("run request with variables").
+			SetBaseURL("https://postman-echo.com").
+			SetVerifySSL(false),
 		TestSteps: []hrp.IStep{
-			hrp.Step("get with params").
+			hrp.NewStep("get with params").
 				WithVariables(map[string]interface{}{
 					"var1":               "bar1",
 					"agent":              "HttpRunnerPlus",
@@ -46,13 +44,11 @@ func TestCaseExtractStepSingle(t *testing.T) {
 // reference extracted variables from previous step
 func TestCaseExtractStepAssociation(t *testing.T) {
 	testcase := &hrp.TestCase{
-		Config: hrp.TConfig{
-			Name:    "run request with variables",
-			BaseURL: "https://postman-echo.com",
-			Verify:  false,
-		},
+		Config: hrp.NewConfig("run request with variables").
+			SetBaseURL("https://postman-echo.com").
+			SetVerifySSL(false),
 		TestSteps: []hrp.IStep{
-			hrp.Step("get with params").
+			hrp.NewStep("get with params").
 				WithVariables(map[string]interface{}{
 					"var1":  "bar1",
 					"agent": "HttpRunnerPlus",
@@ -66,12 +62,11 @@ func TestCaseExtractStepAssociation(t *testing.T) {
 				WithJmesPath("body.args.foo1", "varFoo1").
 				Validate().
 				AssertEqual("$statusCode", 200, "check status code").
-				AssertEqual("headers.Connection", "keep-alive", "check header Connection").
 				AssertEqual("$contentType", "application/json; charset=utf-8", "check header Content-Type").
 				AssertEqual("$varFoo1", "bar1", "check args foo1").
 				AssertEqual("body.args.foo2", "bar2", "check args foo2").
 				AssertEqual("body.headers.\"user-agent\"", "HttpRunnerPlus", "check header user agent"),
-			hrp.Step("post json data").
+			hrp.NewStep("post json data").
 				POST("/post").
 				WithHeaders(map[string]string{"User-Agent": "HttpRunnerPlus"}).
 				WithBody(map[string]interface{}{"foo1": "bar1", "foo2": "bar2"}).

@@ -3,14 +3,21 @@
         "name": "demo with complex mechanisms",
         "base_url": "https://postman-echo.com",
         "variables": {
-            "a": 12.3,
+            "a": "${sum(10, 2.3)}",
             "b": 3.45,
-            "n": 5,
+            "n": "${sum_ints(1, 2, 2)}",
             "varFoo1": "${gen_random_string($n)}",
             "varFoo2": "${max($a, $b)}"
         }
     },
     "teststeps": [
+        {
+            "name": "transaction 1 start",
+            "transaction": {
+                "name": "tran1",
+                "type": "start"
+            }
+        },
         {
             "name": "get with params",
             "request": {
@@ -27,8 +34,15 @@
             "variables": {
                 "b": 34.5,
                 "n": 3,
+                "name": "get with params",
                 "varFoo2": "${max($a, $b)}"
             },
+            "setup_hooks": [
+                "${setup_hook_example($name)}"
+            ],
+            "teardown_hooks": [
+                "${teardown_hook_example($name)}"
+            ],
             "extract": {
                 "varFoo1": "body.args.foo1"
             },
@@ -63,6 +77,13 @@
                     "msg": "check args foo2"
                 }
             ]
+        },
+        {
+            "name": "transaction 1 end",
+            "transaction": {
+                "name": "tran1",
+                "type": "end"
+            }
         },
         {
             "name": "post json data",
@@ -105,8 +126,12 @@
                 },
                 "body": {
                     "foo1": "$varFoo1",
-                    "foo2": "${max($a, $b)}"
+                    "foo2": "${max($a, $b)}",
+                    "time": "${get_timestamp()}"
                 }
+            },
+            "extract": {
+                "varTime": "body.form.time"
             },
             "validate": [
                 {
@@ -126,6 +151,24 @@
                     "assert": "equals",
                     "expect": "12.3",
                     "msg": "check args foo2"
+                }
+            ]
+        },
+        {
+            "name": "get with timestamp",
+            "request": {
+                "method": "GET",
+                "url": "/get",
+                "params": {
+                    "time": "$varTime"
+                }
+            },
+            "validate": [
+                {
+                    "check": "body.args.time",
+                    "assert": "length_equals",
+                    "expect": 13,
+                    "msg": "check extracted var timestamp"
                 }
             ]
         }

@@ -1,7 +1,7 @@
 package hrp
 
 import (
-	"encoding/json"
+	builtinJSON "encoding/json"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -9,9 +9,21 @@ import (
 	"strings"
 
 	"github.com/maja42/goval"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 
-	"github.com/httprunner/hrp/builtin"
+	"github.com/httprunner/hrp/internal/builtin"
+	pluginInternal "github.com/httprunner/hrp/plugin/go"
+	pluginUtils "github.com/httprunner/hrp/plugin/utils"
 )
+
+func newParser() *parser {
+	return &parser{}
+}
+
+type parser struct {
+	plugin pluginInternal.IPlugin // plugin is used to call functions
+}
 
 func buildURL(baseURL, stepURL string) string {
 	uConfig, err := url.Parse(baseURL)
@@ -30,9 +42,9 @@ func buildURL(baseURL, stepURL string) string {
 	return uStep.String()
 }
 
-func parseHeaders(rawHeaders map[string]string, variablesMapping map[string]interface{}) (map[string]string, error) {
+func (p *parser) parseHeaders(rawHeaders map[string]string, variablesMapping map[string]interface{}) (map[string]string, error) {
 	parsedHeaders := make(map[string]string)
-	headers, err := parseData(rawHeaders, variablesMapping)
+	headers, err := p.parseData(rawHeaders, variablesMapping)
 	if err != nil {
 		return rawHeaders, err
 	}
@@ -52,22 +64,22 @@ func convertString(raw interface{}) string {
 	}
 }
 
-func parseData(raw interface{}, variablesMapping map[string]interface{}) (interface{}, error) {
+func (p *parser) parseData(raw interface{}, variablesMapping map[string]interface{}) (interface{}, error) {
 	rawValue := reflect.ValueOf(raw)
 	switch rawValue.Kind() {
 	case reflect.String:
 		// json.Number
-		if rawValue, ok := raw.(json.Number); ok {
+		if rawValue, ok := raw.(builtinJSON.Number); ok {
 			return parseJSONNumber(rawValue)
 		}
 		// other string
 		value := rawValue.String()
 		value = strings.TrimSpace(value)
-		return parseString(value, variablesMapping)
+		return p.parseString(value, variablesMapping)
 	case reflect.Slice:
 		parsedSlice := make([]interface{}, rawValue.Len())
 		for i := 0; i < rawValue.Len(); i++ {
-			parsedValue, err := parseData(rawValue.Index(i).Interface(), variablesMapping)
+			parsedValue, err := p.parseData(rawValue.Index(i).Interface(), variablesMapping)
 			if err != nil {
 				return raw, err
 			}
@@ -77,12 +89,12 @@ func parseData(raw interface{}, variablesMapping map[string]interface{}) (interf
 	case reflect.Map: // convert any map to map[string]interface{}
 		parsedMap := make(map[string]interface{})
 		for _, k := range rawValue.MapKeys() {
-			parsedKey, err := parseString(k.String(), variablesMapping)
+			parsedKey, err := p.parseString(k.String(), variablesMapping)
 			if err != nil {
 				return raw, err
 			}
 			v := rawValue.MapIndex(k)
-			parsedValue, err := parseData(v.Interface(), variablesMapping)
+			parsedValue, err := p.parseData(v.Interface(), variablesMapping)
 			if err != nil {
 				return raw, err
 			}
@@ -97,7 +109,7 @@ func parseData(raw interface{}, variablesMapping map[string]interface{}) (interf
 	}
 }
 
-func parseJSONNumber(raw json.Number) (interface{}, error) {
+func parseJSONNumber(raw builtinJSON.Number) (interface{}, error) {
 	if strings.Contains(raw.String(), ".") {
 		// float64
 		return raw.Float64()
@@ -120,7 +132,7 @@ var (
 )
 
 // parseString parse string with variables
-func parseString(raw string, variablesMapping map[string]interface{}) (interface{}, error) {
+func (p *parser) parseString(raw string, variablesMapping map[string]interface{}) (interface{}, error) {
 	matchStartPosition := 0
 	parsedString := ""
 	remainedString := raw
@@ -159,15 +171,19 @@ func parseString(raw string, variablesMapping map[string]interface{}) (interface
 			if err != nil {
 				return raw, err
 			}
-			parsedArgs, err := parseData(arguments, variablesMapping)
+			parsedArgs, err := p.parseData(arguments, variablesMapping)
 			if err != nil {
 				return raw, err
 			}
 
-			result, err := callFunc(funcName, parsedArgs.([]interface{})...)
+			result, err := p.callFunc(funcName, parsedArgs.([]interface{})...)
 			if err != nil {
+				log.Error().Str("funcName", funcName).Interface("arguments", arguments).
+					Err(err).Msg("call function failed")
 				return raw, err
 			}
+			log.Info().Str("funcName", funcName).Interface("arguments", arguments).
+				Interface("output", result).Msg("call function success")
 
 			if funcMatched[0] == raw {
 				// raw_string is a function, e.g. "${add_one(3)}", return its eval value directly
@@ -221,6 +237,25 @@ func parseString(raw string, variablesMapping map[string]interface{}) (interface
 	return parsedString, nil
 }
 
+// callFunc calls function with arguments
+// only support return at most one result value
+func (p *parser) callFunc(funcName string, arguments ...interface{}) (interface{}, error) {
+	// call with plugin function
+	if p.plugin != nil && p.plugin.Has(funcName) {
+		return p.plugin.Call(funcName, arguments...)
+	}
+
+	// get builtin function
+	function, ok := builtin.Functions[funcName]
+	if !ok {
+		return nil, fmt.Errorf("function %s is not found", funcName)
+	}
+	fn := reflect.ValueOf(function)
+
+	// call with builtin function
+	return pluginUtils.CallFunc(fn, arguments...)
+}
+
 // merge two variables mapping, the first variables have higher priority
 func mergeVariables(variables, overriddenVariables map[string]interface{}) map[string]interface{} {
 	if overriddenVariables == nil {
@@ -244,74 +279,6 @@ func mergeVariables(variables, overriddenVariables map[string]interface{}) map[s
 		mergedVariables[k] = v
 	}
 	return mergedVariables
-}
-
-// callFunc call function with arguments
-// only support return at most one result value
-func callFunc(funcName string, arguments ...interface{}) (interface{}, error) {
-	function, ok := builtin.Functions[funcName]
-	if !ok {
-		// function not found
-		return nil, fmt.Errorf("function %s is not found", funcName)
-	}
-
-	funcValue := reflect.ValueOf(function)
-	if funcValue.Kind() != reflect.Func {
-		// function not valid
-		return nil, fmt.Errorf("function %s is invalid", funcName)
-	}
-
-	if funcValue.Type().NumIn() != len(arguments) {
-		// function arguments not match
-		return nil, fmt.Errorf("function %s arguments number not match", funcName)
-	}
-
-	argumentsValue := make([]reflect.Value, len(arguments))
-	for index, argument := range arguments {
-		argumentValue := reflect.ValueOf(argument)
-		expectArgumentType := funcValue.Type().In(index)
-		actualArgumentType := reflect.TypeOf(argument)
-
-		// type match
-		if expectArgumentType == actualArgumentType {
-			argumentsValue[index] = argumentValue
-			continue
-		}
-
-		// type not match, check if convertible
-		if !actualArgumentType.ConvertibleTo(expectArgumentType) {
-			// function argument type not match and not convertible
-			err := fmt.Errorf("function %s argument %d type is neither match nor convertible, expect %v, actual %v",
-				funcName, index, expectArgumentType, actualArgumentType)
-			log.Error().Err(err).Msg("call function failed")
-			return nil, err
-		}
-		// convert argument to expect type
-		argumentsValue[index] = argumentValue.Convert(expectArgumentType)
-	}
-
-	resultValues := funcValue.Call(argumentsValue)
-	if len(resultValues) > 1 {
-		// function should return at most one value
-		err := fmt.Errorf("function %s should return at most one value", funcName)
-		log.Error().Err(err).Msg("call function failed")
-		return nil, err
-	}
-
-	// no return value
-	if len(resultValues) == 0 {
-		return nil, nil
-	}
-
-	// return one value
-	// convert reflect.Value to interface{}
-	result := resultValues[0].Interface()
-	log.Info().
-		Str("funcName", funcName).
-		Interface("arguments", arguments).
-		Interface("output", result).
-		Msg("call function success")
-	return result, nil
 }
 
 var eval = goval.NewEvaluator()
@@ -360,7 +327,7 @@ func parseFunctionArguments(argsStr string) ([]interface{}, error) {
 	return arguments, nil
 }
 
-func parseVariables(variables map[string]interface{}) (map[string]interface{}, error) {
+func (p *parser) parseVariables(variables map[string]interface{}) (map[string]interface{}, error) {
 	parsedVariables := make(map[string]interface{})
 	var traverseRounds int
 
@@ -398,7 +365,7 @@ func parseVariables(variables map[string]interface{}) (map[string]interface{}, e
 				return variables, fmt.Errorf("variable not defined: %v", undefinedVars)
 			}
 
-			parsedValue, err := parseData(varValue, parsedVariables)
+			parsedValue, err := p.parseData(varValue, parsedVariables)
 			if err != nil {
 				continue
 			}
@@ -491,4 +458,180 @@ func findallVariables(raw string) variableSet {
 	}
 
 	return varSet
+}
+
+func genCartesianProduct(paramsMap map[string]paramsType) paramsType {
+	if len(paramsMap) == 0 {
+		return nil
+	}
+	var params []paramsType
+	for _, v := range paramsMap {
+		params = append(params, v)
+	}
+	var cartesianProduct paramsType
+	cartesianProduct = params[0]
+	for i := 0; i < len(params)-1; i++ {
+		var tempProduct paramsType
+		for _, param1 := range cartesianProduct {
+			for _, param2 := range params[i+1] {
+				tempProduct = append(tempProduct, mergeVariables(param1, param2))
+			}
+		}
+		cartesianProduct = tempProduct
+	}
+	return cartesianProduct
+}
+
+func parseParameters(parameters map[string]interface{}, variablesMapping map[string]interface{}) (map[string]paramsType, error) {
+	if len(parameters) == 0 {
+		return nil, nil
+	}
+	parsedParametersSlice := make(map[string]paramsType)
+	var err error
+	for k, v := range parameters {
+		var parameterSlice paramsType
+		rawValue := reflect.ValueOf(v)
+		switch rawValue.Kind() {
+		case reflect.String:
+			// e.g. username-password: ${parameterize(examples/account.csv)} -> [{"username": "test1", "password": "111111"}, {"username": "test2", "password": "222222"}]
+			var parsedParameterContent interface{}
+			parsedParameterContent, err = newParser().parseString(rawValue.String(), variablesMapping)
+			if err != nil {
+				log.Error().Interface("parameterContent", rawValue).Msg("[parseParameters] parse parameter content error")
+				return nil, err
+			}
+			parsedParameterRawValue := reflect.ValueOf(parsedParameterContent)
+			if parsedParameterRawValue.Kind() != reflect.Slice {
+				log.Error().Interface("parameterContent", parsedParameterRawValue).Msg("[parseParameters] parsed parameter content should be slice")
+				return nil, errors.New("parsed parameter content should be slice")
+			}
+			parameterSlice, err = parseSlice(k, parsedParameterRawValue.Interface())
+		case reflect.Slice:
+			// e.g. user_agent: ["iOS/10.1", "iOS/10.2"] -> [{"user_agent": "iOS/10.1"}, {"user_agent": "iOS/10.2"}]
+			parameterSlice, err = parseSlice(k, rawValue.Interface())
+		default:
+			log.Error().Interface("parameter", parameters).Msg("[parseParameters] parameter content should be slice or text(functions call)")
+			return nil, errors.New("parameter content should be slice or text(functions call)")
+		}
+		if err != nil {
+			return nil, err
+		}
+		parsedParametersSlice[k] = parameterSlice
+	}
+	return parsedParametersSlice, nil
+}
+
+func parseSlice(parameterName string, parameterContent interface{}) ([]map[string]interface{}, error) {
+	parameterNameSlice := strings.Split(parameterName, "-")
+	var parameterSlice []map[string]interface{}
+	parameterContentSlice := reflect.ValueOf(parameterContent)
+	if parameterContentSlice.Kind() != reflect.Slice {
+		return nil, errors.New("parameterContent should be slice")
+	}
+	for i := 0; i < parameterContentSlice.Len(); i++ {
+		parameterMap := make(map[string]interface{})
+		elem := reflect.ValueOf(parameterContentSlice.Index(i).Interface())
+		switch elem.Kind() {
+		case reflect.Map:
+			// e.g. "username-password": [{"username": "test1", "password": "passwd1", "other": "111"}, {"username": "test2", "password": "passwd2", "other": ""222}]
+			// -> [{"username": "test1", "password": "passwd1"}, {"username": "test2", "password": "passwd2"}]
+			for _, key := range parameterNameSlice {
+				if _, ok := elem.Interface().(map[string]interface{})[key]; ok {
+					parameterMap[key] = elem.MapIndex(reflect.ValueOf(key)).Interface()
+				} else {
+					log.Error().Interface("parameterNameSlice", parameterNameSlice).Msg("[parseParameters] parameter name not found")
+					return nil, errors.New("parameter name not found")
+				}
+			}
+		case reflect.Slice:
+			// e.g. "username-password": [["test1", "passwd1"], ["test2", "passwd2"]]
+			// -> [{"username": "test1", "password": "passwd1"}, {"username": "test2", "password": "passwd2"}]
+			if len(parameterNameSlice) != elem.Len() {
+				log.Error().Interface("parameterNameSlice", parameterNameSlice).Interface("parameterContent", elem.Interface()).Msg("[parseParameters] parameter name slice and parameter content slice should have the same length")
+				return nil, errors.New("parameter name slice and parameter content slice should have the same length")
+			} else {
+				for j := 0; j < elem.Len(); j++ {
+					parameterMap[parameterNameSlice[j]] = elem.Index(j).Interface()
+				}
+			}
+		default:
+			// e.g. "app_version": [3.1, 3.0]
+			// -> [{"app_version": 3.1}, {"app_version": 3.0}]
+			if len(parameterNameSlice) != 1 {
+				log.Error().Interface("parameterNameSlice", parameterNameSlice).Msg("[parseParameters] parameter name slice should have only one element when parameter content is string")
+				return nil, errors.New("parameter name slice should have only one element when parameter content is string")
+			}
+			parameterMap[parameterNameSlice[0]] = elem.Interface()
+		}
+		parameterSlice = append(parameterSlice, parameterMap)
+	}
+	return parameterSlice, nil
+}
+
+func initParameterIterator(cfg *TConfig, mode string) (err error) {
+	var parameters map[string]paramsType
+	parameters, err = parseParameters(cfg.Parameters, cfg.Variables)
+	if err != nil {
+		return err
+	}
+	// parse config parameters setting
+	if cfg.ParametersSetting == nil {
+		cfg.ParametersSetting = &TParamsConfig{Iterators: []*Iterator{}}
+	}
+	// boomer模式下不限制迭代次数
+	if mode == "boomer" {
+		cfg.ParametersSetting.Iteration = -1
+	}
+	rawValue := reflect.ValueOf(cfg.ParametersSetting.Strategy)
+	switch rawValue.Kind() {
+	case reflect.Map:
+		// strategy: {"user_agent": "sequential", "username-password": "random"}, 每个参数对应一个迭代器，每个迭代器随机、顺序选取元素互不影响
+		for k, v := range parameters {
+			if _, ok := rawValue.Interface().(map[string]interface{})[k]; ok {
+				// use strategy if configured
+				cfg.ParametersSetting.Iterators = append(
+					cfg.ParametersSetting.Iterators,
+					newIterator(v, rawValue.MapIndex(reflect.ValueOf(k)).Interface().(string), cfg.ParametersSetting.Iteration),
+				)
+			} else {
+				// use sequential strategy by default
+				cfg.ParametersSetting.Iterators = append(
+					cfg.ParametersSetting.Iterators,
+					newIterator(v, strategySequential, cfg.ParametersSetting.Iteration),
+				)
+			}
+		}
+	case reflect.String:
+		// strategy: random, 仅生成一个的迭代器，该迭代器在参数笛卡尔积slice中随机选取元素
+		if len(rawValue.String()) == 0 {
+			cfg.ParametersSetting.Strategy = strategySequential
+		} else {
+			cfg.ParametersSetting.Strategy = strings.ToLower(rawValue.String())
+		}
+		cfg.ParametersSetting.Iterators = append(
+			cfg.ParametersSetting.Iterators,
+			newIterator(genCartesianProduct(parameters), cfg.ParametersSetting.Strategy.(string), cfg.ParametersSetting.Iteration),
+		)
+	default:
+		// default strategy: sequential, 仅生成一个的迭代器，该迭代器在参数笛卡尔积slice中顺序选取元素
+		cfg.ParametersSetting.Strategy = strategySequential
+		cfg.ParametersSetting.Iterators = append(
+			cfg.ParametersSetting.Iterators,
+			newIterator(genCartesianProduct(parameters), cfg.ParametersSetting.Strategy.(string), cfg.ParametersSetting.Iteration),
+		)
+	}
+	return nil
+}
+
+func newIterator(parameters paramsType, strategy string, iteration int) *Iterator {
+	iter := parameters.Iterator()
+	iter.strategy = strategy
+	if iteration > 0 {
+		iter.iteration = iteration
+	} else if iteration < 0 {
+		iter.iteration = -1
+	} else if iter.iteration == 0 {
+		iter.iteration = 1
+	}
+	return iter
 }
